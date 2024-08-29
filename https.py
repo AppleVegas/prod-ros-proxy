@@ -12,6 +12,8 @@ import dns.resolver
 import logging
 from ros_crypt import rosEncryptor, rosEncryptorResult
 
+import hashlib
+
 handler = logging.StreamHandler()
 handler.setLevel(logging.INFO)
 handler.setFormatter(logging.Formatter('[%(levelname)s] %(asctime)s: %(message)s', datefmt='%H:%M:%S'))
@@ -23,55 +25,6 @@ logger.setLevel(logging.INFO)
 sslctx = ssl.create_default_context()
 sslctx.check_hostname = False
 sslctx.verify_mode = ssl.CERT_NONE
-
-def GetRockstarTicketXml():
-    root = Element("Response")
-    root.set("ms", str(30.0))
-    root.set("xmlns", "CreateTicketResponse")
-
-    def appendchildElement(root, key, value):
-        child = SubElement(root, key)
-        child.text = str(value)
-        return child
-    
-    def appendElement(key, value):
-        return appendchildElement(root, key, value)
-
-    appendElement("Status", 1)
-    appendElement("Ticket", "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFh") # 'a' repeated
-    appendElement("PosixTime", time.time())
-    appendElement("SecsUntilExpiration", 86399)
-    appendElement("PlayerAccountId", 174830472)
-    appendElement("PublicIp", "127.0.0.1")
-    appendElement("SessionId", 5)
-    appendElement("SessionKey", "MDEyMzQ1Njc4OWFiY2RlZg==") # '0123456789abcdef'
-    appendElement("SessionTicket", "vhASmPR0NnA7MZsdVCTCV/3XFABWGa9duCEscmAM0kcCDVEa7YR/rQ4kfHs2HIPIttq08TcxIzuwyPWbaEllvQ==")
-    appendElement("CloudKey", "8G8S9JuEPa3kp74FNQWxnJ5BXJXZN1NFCiaRRNWaAUR=")
-
-    services = appendElement("Services", "")
-    services.set("Count", "0")
-
-    rockstarElement = appendElement("RockstarAccount", "")
-
-    appendchildElement(rockstarElement, "RockstarId", 174830472)
-    appendchildElement(rockstarElement, "Age", 18)
-    appendchildElement(rockstarElement, "AvatarUrl", "Bully/b20.png")
-    appendchildElement(rockstarElement, "CountryCode", "CA")
-    appendchildElement(rockstarElement, "Email", "onlineservices@fivem.net")
-    appendchildElement(rockstarElement, "LanguageCode", "en")
-    appendchildElement(rockstarElement, "Nickname", "WhyDoYouCare")
-
-    appendElement("Privileges", "1,2,3,4,5,6,8,9,10,11,14,15,16,17,18,19,21,22,27")
-
-    privsElement = appendElement("Privs", "")
-    privElement = appendchildElement(privsElement, "p", "")
-    privElement.set("id", "27")
-    privElement.set("g", "True")
-
-    f = BytesIO()
-    ElementTree(root).write(f, encoding='utf-8', xml_declaration=True) 
-    return f.getvalue().decode("utf-8")
-
 
 class cachedResolver(dns.resolver.Resolver):
     def __init__(self, *args, **kwargs):
@@ -89,14 +42,44 @@ class cachedResolver(dns.resolver.Resolver):
 
 resolver = cachedResolver()
 
+class rosSession():
+    def __init__(self, platform: str, sessionTicket: str):
+        self.sessionTicket = sessionTicket
+        self.md5 = hashlib.md5(sessionTicket.encode('utf-8')).hexdigest()
+        self.sessionKey = None
+        self.encryptor = rosEncryptor(platform)
+    
+    def setSessionKey(self, sessionKey: str):
+        self.sessionKey = sessionKey
+        self.encryptor.set_sessionkey_base64(sessionKey)
 
-encryptor = rosEncryptor('pc')
+class rosService():
+    def __init__(self, platform: str):
+        self.platform = platform
+        self.sessions = {}
+    
+    def session(self, sessionTicket: str) -> rosSession:
+        if sessionTicket not in self.sessions:
+            self.sessions[sessionTicket] = rosSession(self.platform, sessionTicket)
+        return self.sessions[sessionTicket]
+
+    def remove_session(self, sessionTicket: str) -> None:
+        del self.sessions[sessionTicket]
+
+service = rosService('pc')
 
 class S(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
     
     def dump(self, request_headers = None, request_body = None, response_headers = None, response_body = None):
+        sessionTicket = self.headers.get("ros-SessionTicket", "")
+
+        if sessionTicket == "":
+            return 
+
+        session = service.session(sessionTicket)
+
         has_security = False
         if "239" in self.headers.get("ros-SecurityFlags", ""):
             has_security = True
@@ -108,10 +91,10 @@ class S(SimpleHTTPRequestHandler):
                 key = None
             if key:
                 logger.info('Found SessionKey!\n')
-                encryptor.set_sessionkey_base64(key)
+                session.setSessionKey(key)
 
         host = self.headers.get("Host", "")
-        path = "paths/" + host + "/" + ("https" if self.is_https else "http") + self.path
+        path = "paths/" + session.md5 + "/" + host + "/" + ("https" if self.is_https else "http") + self.path
 
         if not os.path.exists(path): 
             os.makedirs(path)   
@@ -121,13 +104,13 @@ class S(SimpleHTTPRequestHandler):
 
         if request_body:
             with open(path + "/requestbody", "wb") as binary_file:
-                binary_file.write((encryptor.decrypt_cl(request_body, True).bytes() if has_security else request_body))
+                binary_file.write((session.encryptor.decrypt_cl(request_body, True).bytes() if has_security else request_body))
 
         with open(path + "/responseheaders", "w") as file:
             file.write(str(response_headers))
 
         with open(path + "/responsebody", "wb") as binary_file:
-            binary_file.write((encryptor.decrypt_sv(response_body, True).bytes() if has_security else response_body))
+            binary_file.write((session.encryptor.decrypt_sv(response_body, True).bytes() if has_security else response_body))
 
     def proxy_response(self, request_type: str):
         host = self.headers.get("Host", "")
